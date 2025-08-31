@@ -1,4 +1,14 @@
+node_modules/
+dist/
+build/
+.venv/
 venv/
 .env
-*.db
-__pycache__/
+.env.*
+.DS_Store
+*.log
+*.zip
+*.tar
+*.gz
+*.mp4
+*.mov
