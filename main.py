@@ -181,6 +181,61 @@ class WhatsAppService:
         except Exception as e:
             logging.error(f"Erreur envoi message: {e}")
             return False
+    def send_interactive_menu(self, to: str, products: list[dict]) -> bool:
+    """
+    Envoie un menu interactif (List Message) WhatsApp.
+    products: [{id:int|str, name:str, description:str, price:float}, ...]
+    """
+    url = f"{self.base_url}/messages"
+    headers = {
+        "Authorization": f"Bearer {self.token}",
+        "Content-Type": "application/json"
+    }
+
+    # Sections (max 10 lignes par section)
+    rows = []
+    for p in products[:10]:
+        title = p.get("name", "Article")
+        desc  = f"{p.get('description','')}".strip()
+        price = p.get("price")
+        if price is not None:
+            desc = (desc + (" - " if desc else "")) + f"€{price}"
+        rows.append({
+            "id": f"product_{p.get('id', title)}",
+            "title": title[:24],          # contraintes WA
+            "description": desc[:72]
+        })
+
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "header": {"type": "text", "text": "🍕 Menu Restaurant"},
+            "body":   {"text": "Choisissez vos articles :"},
+            "footer": {"text": "Tapez 'confirmer' pour valider"},
+            "action": {
+                "button": "Voir menu",
+                "sections": [{
+                    "title": "Nos produits",
+                    "rows": rows
+                }]
+            }
+        }
+    }
+
+    try:
+        r = requests.post(url, json=data, headers=headers, timeout=15)
+        ok = r.status_code in (200, 201)
+        if ok:
+            logging.info(f"WA interactive ok: {r.text}")
+        else:
+            logging.error(f"WA interactive failed {r.status_code}: {r.text}")
+        return ok
+    except Exception as e:
+        logging.error(f"Erreur menu interactif: {e}")
+        return False
 
 
 # Service de gestion des commandes
@@ -258,7 +313,7 @@ class ConversationService:
         response = ""
         
         if ai_response["intent"] == "greeting":
-            response = "🍕 Bonjour! Bienvenue chez Restaurant Bot. Tapez 'menu' pour voir nos plats ou décrivez ce que vous souhaitez commander!"
+            response = "🍕 Bonjour! Bienvenue chez Barita Resto. Tapez 'menu' pour voir nos plats ou décrivez ce que vous souhaitez commander!"
             context["state"] = "menu_requested"
             
         elif ai_response["intent"] == "inquiry" and "menu" in message.lower():
@@ -295,6 +350,23 @@ class ConversationService:
                 
         else:
             response = ai_response.get("response", "Je n'ai pas compris. Tapez 'menu' pour voir nos options!")
+            
+        elif ai_response["intent"] == "inquiry" and "menu" in message.lower():
+            
+            products = self.db.query(Product).filter(Product.available == "true").all()
+            products_dict = [{"id": p.id, "name": p.name, "description": p.description, "price": p.price} for p in products]
+
+            ok = self.whatsapp_service.send_interactive_menu(phone_number, products_dict)
+            if not ok:
+                # fallback en texte simple
+                lines = ["🍕 *Notre menu*"]
+                for p in products[:10]:
+                    lines.append(f"• {p.name} — €{p.price}")
+                lines.append("\nRépondez par ex. : 2 margherita, 1 coca")
+                self.whatsapp_service.send_message(phone_number, "\n".join(lines))
+
+            response = "📋 Menu envoyé ! Vous pouvez aussi me dire directement ce que vous voulez."
+
         
         # Sauvegarder le contexte
         self.update_conversation_context(phone_number, context)
