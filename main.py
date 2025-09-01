@@ -131,12 +131,13 @@ class AIService:
         
         try:
             response = self.openai_client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f"Message: {message}\nContexte: {context}"}
                 ],
-                temperature=0.3
+                temperature=0.3,
+                max_tokens=200
             )
             
             return json.loads(response.choices[0].message.content)
@@ -154,9 +155,8 @@ class WhatsAppService:
     def __init__(self):
         self.token = config.WHATSAPP_TOKEN
         self.phone_id = config.WHATSAPP_PHONE_ID
-        # aligne avec tes tests curl
-        self.base_url = f"https://graph.facebook.com/v22.0/{self.phone_id}"
-
+        self.base_url = f"https://graph.facebook.com/v18.0/{self.phone_id}"
+        
     def send_message(self, to: str, message: str) -> bool:
         """Envoie un message texte"""
         url = f"{self.base_url}/messages"
@@ -164,79 +164,79 @@ class WhatsAppService:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json"
         }
+        
         data = {
             "messaging_product": "whatsapp",
             "to": to,
-            "type": "text",            # <- IMPORTANT
+            "type": "text",
             "text": {"body": message}
         }
+        
         try:
             logging.info(f"WA token head: {self.token[:6]}..., phone_id={self.phone_id}")
-            r = requests.post(url, json=data, headers=headers, timeout=15)
-            if r.status_code in (200, 201):
-                logging.info(f"WA send ok: {r.text}")
+            response = requests.post(url, json=data, headers=headers, timeout=15)
+            if response.status_code in (200, 201):
+                logging.info(f"WA send ok: {response.text}")
                 return True
-            logging.error(f"WA send failed {r.status_code}: {r.text}")
-            return False
+            else:
+                logging.error(f"WA send failed {response.status_code}: {response.text}")
+                return False
         except Exception as e:
             logging.error(f"Erreur envoi message: {e}")
             return False
-    def send_interactive_menu(self, to: str, products: list[dict]) -> bool:
-    """
-    Envoie un menu interactif (List Message) WhatsApp.
-    products: [{id:int|str, name:str, description:str, price:float}, ...]
-    """
-    url = f"{self.base_url}/messages"
-    headers = {
-        "Authorization": f"Bearer {self.token}",
-        "Content-Type": "application/json"
-    }
-
-    # Sections (max 10 lignes par section)
-    rows = []
-    for p in products[:10]:
-        title = p.get("name", "Article")
-        desc  = f"{p.get('description','')}".strip()
-        price = p.get("price")
-        if price is not None:
-            desc = (desc + (" - " if desc else "")) + f"€{price}"
-        rows.append({
-            "id": f"product_{p.get('id', title)}",
-            "title": title[:24],          # contraintes WA
-            "description": desc[:72]
-        })
-
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "interactive",
-        "interactive": {
-            "type": "list",
-            "header": {"type": "text", "text": "🍕 Menu Restaurant"},
-            "body":   {"text": "Choisissez vos articles :"},
-            "footer": {"text": "Tapez 'confirmer' pour valider"},
-            "action": {
-                "button": "Voir menu",
-                "sections": [{
-                    "title": "Nos produits",
-                    "rows": rows
-                }]
+    
+    def send_interactive_menu(self, to: str, products: List[Dict]) -> bool:
+        """Envoie un menu interactif"""
+        url = f"{self.base_url}/messages"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Préparer les lignes du menu
+        rows = []
+        for p in products[:10]:
+            title = p.get("name", "Article")
+            desc = f"{p.get('description', '')}".strip()
+            price = p.get("price")
+            if price is not None:
+                desc = (desc + (" - " if desc else "")) + f"€{price}"
+            rows.append({
+                "id": f"product_{p.get('id', title)}",
+                "title": title[:24],
+                "description": desc[:72]
+            })
+        
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "header": {"type": "text", "text": "🍕 Menu Restaurant"},
+                "body": {"text": "Choisissez vos articles :"},
+                "footer": {"text": "Tapez 'confirmer' pour valider"},
+                "action": {
+                    "button": "Voir menu",
+                    "sections": [{
+                        "title": "Nos produits",
+                        "rows": rows
+                    }]
+                }
             }
         }
-    }
-
-    try:
-        r = requests.post(url, json=data, headers=headers, timeout=15)
-        ok = r.status_code in (200, 201)
-        if ok:
-            logging.info(f"WA interactive ok: {r.text}")
-        else:
-            logging.error(f"WA interactive failed {r.status_code}: {r.text}")
-        return ok
-    except Exception as e:
-        logging.error(f"Erreur menu interactif: {e}")
-        return False
-
+        
+        try:
+            response = requests.post(url, json=data, headers=headers, timeout=15)
+            ok = response.status_code in (200, 201)
+            if ok:
+                logging.info(f"WA interactive ok: {response.text}")
+            else:
+                logging.error(f"WA interactive failed {response.status_code}: {response.text}")
+            return ok
+        except Exception as e:
+            logging.error(f"Erreur menu interactif: {e}")
+            return False
 
 # Service de gestion des commandes
 class OrderService:
@@ -321,8 +321,16 @@ class ConversationService:
             products = self.db.query(Product).filter(Product.available == "true").all()
             products_dict = [{"id": p.id, "name": p.name, "description": p.description, "price": p.price} for p in products]
             
-            self.whatsapp_service.send_interactive_menu(phone_number, products_dict)
-            response = "📋 Voici notre menu! Vous pouvez aussi me dire directement ce que vous voulez, par exemple: 'Je veux 2 pizzas margherita et 1 coca'"
+            ok = self.whatsapp_service.send_interactive_menu(phone_number, products_dict)
+            if not ok:
+                # fallback en texte simple
+                lines = ["🍕 *Notre menu*"]
+                for p in products[:10]:
+                    lines.append(f"• {p.name} — €{p.price}")
+                lines.append("\nRépondez par ex. : 2 margherita, 1 coca")
+                self.whatsapp_service.send_message(phone_number, "\n".join(lines))
+            
+            response = "📋 Menu envoyé ! Vous pouvez aussi me dire directement ce que vous voulez."
             
         elif ai_response["intent"] == "order":
             # Traiter la commande
@@ -350,23 +358,6 @@ class ConversationService:
                 
         else:
             response = ai_response.get("response", "Je n'ai pas compris. Tapez 'menu' pour voir nos options!")
-            
-        elif ai_response["intent"] == "inquiry" and "menu" in message.lower():
-            
-            products = self.db.query(Product).filter(Product.available == "true").all()
-            products_dict = [{"id": p.id, "name": p.name, "description": p.description, "price": p.price} for p in products]
-
-            ok = self.whatsapp_service.send_interactive_menu(phone_number, products_dict)
-            if not ok:
-                # fallback en texte simple
-                lines = ["🍕 *Notre menu*"]
-                for p in products[:10]:
-                    lines.append(f"• {p.name} — €{p.price}")
-                lines.append("\nRépondez par ex. : 2 margherita, 1 coca")
-                self.whatsapp_service.send_message(phone_number, "\n".join(lines))
-
-            response = "📋 Menu envoyé ! Vous pouvez aussi me dire directement ce que vous voulez."
-
         
         # Sauvegarder le contexte
         self.update_conversation_context(phone_number, context)
@@ -492,115 +483,3 @@ if __name__ == "__main__":
     init_sample_data()
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-# Instructions de déploiement et configuration dans le README ci-dessous
-"""
-# 🤖 Agent IA WhatsApp - Système de Commandes
-
-## 📋 Fonctionnalités
-
-✅ **Conversation naturelle**: L'IA comprend les demandes en langage naturel
-✅ **Menu interactif**: Affichage du menu avec boutons WhatsApp  
-✅ **Gestion des commandes**: Ajout, modification, confirmation
-✅ **Suivi en temps réel**: Notifications de statut automatiques
-✅ **Interface admin**: Gestion des produits et commandes
-✅ **Base de données**: Stockage persistant des données
-
-## 🚀 Installation
-
-1. **Cloner le projet**:
-```bash
-git clone <repo>
-cd whatsapp-ai-agent
-```
-
-2. **Installer les dépendances**:
-```bash
-pip install fastapi uvicorn sqlalchemy psycopg2-binary
-pip install requests python-dotenv openai anthropic
-pip install python-multipart jinja2
-```
-
-3. **Configuration environnement** (.env):
-```env
-WHATSAPP_TOKEN=your_whatsapp_business_token
-WHATSAPP_PHONE_ID=your_phone_number_id  
-WHATSAPP_VERIFY_TOKEN=your_verify_token
-OPENAI_API_KEY=your_openai_key
-DATABASE_URL=postgresql://user:password@localhost/whatsapp_orders
-```
-
-4. **Lancer l'application**:
-```bash
-python main.py
-```
-
-## ⚙️ Configuration WhatsApp Business
-
-1. Créer une app Meta Developer
-2. Configurer WhatsApp Business API
-3. Obtenir le token et phone_id  
-4. Configurer le webhook: `https://yourdomain.com/webhook`
-5. Vérifier avec le verify_token
-
-## 📱 Utilisation
-
-**Commandes clients:**
-- "Bonjour" → Accueil
-- "Menu" → Affichage menu interactif  
-- "Je veux 2 pizzas margherita" → Ajouter à la commande
-- "Confirmer" → Valider la commande
-
-**Interface admin:**
-- `GET /admin/orders` → Liste des commandes
-- `PUT /admin/orders/{id}/status` → Changer statut
-- `POST /admin/products` → Ajouter produit
-
-## 🔧 Architecture
-
-```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   WhatsApp      │────│  FastAPI Server  │────│   Database      │
-│   Business API  │    │                  │    │   PostgreSQL    │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-                              │
-                       ┌──────────────┐
-                       │  OpenAI API  │
-                       │  (Processing)│
-                       └──────────────┘
-```
-
-## 🎯 Flux de conversation
-
-1. **Client** → Message WhatsApp
-2. **Webhook** → Réception FastAPI  
-3. **IA** → Analyse et extraction d'entités
-4. **Logique** → Traitement de la commande
-5. **Réponse** → Envoi via WhatsApp API
-6. **Suivi** → Notifications automatiques
-
-## 📊 Exemples d'interaction
-
-**Client**: "Salut, je voudrais commander"  
-**Bot**: "🍕 Bonjour! Bienvenue chez Restaurant Bot..."
-
-**Client**: "2 pizzas margherita et 1 coca"  
-**Bot**: "✅ Ajouté à votre commande!\n📋 Récapitulatif:\n• 2x Pizza Margherita - €24\n• 1x Coca-Cola - €3\n💰 Total: €27"
-
-**Client**: "Confirmer"  
-**Bot**: "🎉 Commande confirmée! Numéro: #123\n⏰ Temps: 25-30 minutes..."
-
-## 🔒 Sécurité
-
-- Validation des tokens WhatsApp
-- Sanitisation des entrées utilisateur  
-- Rate limiting sur les endpoints
-- Logs détaillés pour monitoring
-
-## 📈 Monitoring
-
-- Logs structurés avec timestamp
-- Métriques de performance  
-- Alertes en cas d'erreur
-- Dashboard admin intégré
-"""
