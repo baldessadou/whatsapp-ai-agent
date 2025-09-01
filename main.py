@@ -549,11 +549,11 @@ def init_sample_data():
             db.commit()
             logging.info("✅ Données de test initialisées.")
         else:
-            # Optionnel : log si les produits existants n'ont pas 'available'
+            # Optionnel : log si les produits existants n'ont pas 'available' test 
             missing = db.query(Product).filter((Product.available.is_(None)) | (Product.available == "")).count()
             if missing:
                 logging.warning(f"{missing} produits sans 'available' défini (fallback all-products activé).")
-    finally:
+    finally: 
         db.close()
 
 if __name__ == "__main__":
