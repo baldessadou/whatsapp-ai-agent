@@ -1,16 +1,17 @@
-# Agent IA WhatsApp - Système de Commandes (version stable)
+# Agent IA WhatsApp - Système de Commandes (version R2)
 # FastAPI + SQLAlchemy + WhatsApp Business Cloud API v22.0
 # - Menu interactif + fallback texte
-# - Parsing robuste des commandes ("2 pizzas margherita", "1 coca", etc.)
-# - Réception des réponses interactives (list_reply)
+# - Parsing robuste ("2 margherita", "2 margherita et 1 coca", "2x carbonara")
+# - Réponses interactives (list_reply)
 # - Confirmation avec "confirmer"
 
 import os
+import re
 import json
 import logging
 import unicodedata
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass
 from enum import Enum
 
@@ -42,7 +43,6 @@ engine = create_engine(config.DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-
 class OrderStatus(Enum):
     PENDING = "pending"
     CONFIRMED = "confirmed"
@@ -51,7 +51,6 @@ class OrderStatus(Enum):
     DELIVERED = "delivered"
     CANCELLED = "cancelled"
 
-
 class Customer(Base):
     __tablename__ = "customers"
     id = Column(Integer, primary_key=True, index=True)
@@ -59,9 +58,7 @@ class Customer(Base):
     name = Column(String)
     address = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-
     orders = relationship("Order", back_populates="customer")
-
 
 class Product(Base):
     __tablename__ = "products"
@@ -71,7 +68,6 @@ class Product(Base):
     price = Column(Float)
     category = Column(String)
     available = Column(String, default="true")  # "true" / "false"
-
 
 class Order(Base):
     __tablename__ = "orders"
@@ -83,9 +79,7 @@ class Order(Base):
     notes = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
-
     customer = relationship("Customer", back_populates="orders")
-
 
 class Conversation(Base):
     __tablename__ = "conversations"
@@ -94,9 +88,7 @@ class Conversation(Base):
     context = Column(Text)  # JSON
     last_interaction = Column(DateTime, default=datetime.utcnow)
 
-
 Base.metadata.create_all(bind=engine)
-
 
 def get_db():
     db = SessionLocal()
@@ -116,7 +108,6 @@ def normalize(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s.replace("-", " ").strip()
 
-
 # -----------------------------------------------------------------------------
 # WhatsApp Service
 # -----------------------------------------------------------------------------
@@ -124,7 +115,6 @@ class WhatsAppService:
     def __init__(self):
         self.token = config.WHATSAPP_TOKEN
         self.phone_id = config.WHATSAPP_PHONE_ID
-        # Aligne avec tes tests cURL
         self.base_url = f"https://graph.facebook.com/v22.0/{self.phone_id}"
 
     def _headers(self) -> Dict[str, str]:
@@ -134,7 +124,6 @@ class WhatsAppService:
         }
 
     def send_message(self, to: str, message: str) -> bool:
-        """Send plain text message."""
         url = f"{self.base_url}/messages"
         data = {
             "messaging_product": "whatsapp",
@@ -155,9 +144,7 @@ class WhatsAppService:
             return False
 
     def send_interactive_menu(self, to: str, products: List[Dict]) -> bool:
-        """Send List Message (interactive)."""
         url = f"{self.base_url}/messages"
-
         rows = []
         for p in products[:10]:
             title = p.get("name", "Article")
@@ -189,7 +176,6 @@ class WhatsAppService:
                 }
             }
         }
-
         try:
             r = requests.post(url, json=data, headers=self._headers(), timeout=15)
             ok = r.status_code in (200, 201)
@@ -201,7 +187,6 @@ class WhatsAppService:
         except Exception as e:
             logging.error(f"WA interactive error: {e}")
             return False
-
 
 # -----------------------------------------------------------------------------
 # Order Service
@@ -233,13 +218,8 @@ class OrderService:
         self.db.refresh(order)
         return order
 
-    def get_customer_orders(self, phone: str) -> List[Order]:
-        customer = self.get_or_create_customer(phone)
-        return self.db.query(Order).filter(Order.customer_id == customer.id).all()
-
-
 # -----------------------------------------------------------------------------
-# Conversation + Intents (rule-based reliable)
+# Conversation + Parsing
 # -----------------------------------------------------------------------------
 class ConversationService:
     def __init__(self, db: Session):
@@ -263,41 +243,48 @@ class ConversationService:
         conv.last_interaction = datetime.utcnow()
         self.db.commit()
 
-    # ---- product lookup helpers
+    # ---- products / synonymes
     def _all_available_products(self) -> List[Product]:
         return self.db.query(Product).filter(Product.available == "true").all()
 
-    def _product_index(self) -> Dict[str, Product]:
+    def _synonyms_map(self) -> Dict[str, Product]:
         """
-        Mappe tokens normalisés -> produit (ex: 'margherita', 'pepperoni', 'carbonara', 'cesar', 'coca', 'eau')
-        + nom complet normalisé
+        Crée un mapping {synonyme_normalise -> produit}
+        Synonymes utiles: dernier mot, nom complet, variantes usuelles.
         """
-        idx: Dict[str, Product] = {}
+        m: Dict[str, Product] = {}
         for p in self._all_available_products():
-            key = normalize(p.name)
-            idx[key] = p
-            # quelques alias utiles
-            if "margherita" in key:
-                idx["margherita"] = p
-                idx["pizza margherita"] = p
-            if "pepperoni" in key:
-                idx["pepperoni"] = p
-                idx["pizza pepperoni"] = p
-            if "carbonara" in key:
-                idx["carbonara"] = p
-                idx["pasta carbonara"] = p
-                idx["pates carbonara"] = p
-            if "cesar" in key or "césar" in key:
-                idx["cesar"] = p
-                idx["salade cesar"] = p
-            if "coca" in key:
-                idx["coca"] = p
-                idx["coca cola"] = p
-            if normalize("eau") in key:
-                idx["eau"] = p
-        return idx
+            full = normalize(p.name)               # ex: "pizza margherita"
+            words = [w for w in full.split() if w] # ["pizza","margherita"]
+            if not words:
+                continue
+            last = words[-1]                       # "margherita"
+            m[full] = p
+            m[last] = p
 
-    # ---- rule-based intent & entity extraction
+            # variantes usuelles
+            if "pepperoni" in full:
+                m["pizza pepperoni"] = p
+                m["pepperoni"] = p
+            if "margherita" in full:
+                m["pizza margherita"] = p
+                m["margherita"] = p
+            if "carbonara" in full:
+                m["carbonara"] = p
+                m["pasta carbonara"] = p
+                m["pates carbonara"] = p
+            if "cesar" in full or "cesar" in last:
+                m["salade cesar"] = p
+                m["cesar"] = p
+            if "coca" in full:
+                m["coca"] = p
+                m["coca cola"] = p
+            if "eau" in full:
+                m["eau"] = p
+                m["eau minerale"] = p
+        return m
+
+    # ---- intent
     def _detect_intent(self, msg: str) -> str:
         m = normalize(msg)
         if any(w in m for w in ["bonjour", "salut", "hello", "coucou"]):
@@ -306,59 +293,53 @@ class ConversationService:
             return "menu"
         if "confirmer" in m or "valider" in m:
             return "confirm"
-        # tentative de parsing d'articles
         items = self._parse_items(m)
         if items:
             return "order"
         return "other"
 
+    # ---- parsing robuste
+    def _split_phrases(self, m: str) -> List[str]:
+        # Sépare sur , ; + et " et " (avec ou sans espaces)
+        m = re.sub(r"\s*(,|;|\+|\bet\b)\s*", "|", m)
+        parts = [p.strip() for p in m.split("|") if p.strip()]
+        return parts or [m]
+
+    def _qty_in_text(self, s: str) -> int:
+        # cherche 2, 2x, 2 x, ×2, etc. (par défaut 1)
+        m = re.search(r"(\d+)\s*(?:x|×)?", s)
+        return max(1, int(m.group(1))) if m else 1
+
     def _parse_items(self, msg_norm: str) -> List[Dict]:
-        """
-        Parse des phrases du style:
-        - "2 pizzas margherita et 1 coca"
-        - "1 pepperoni, 2 coca"
-        Retour: [{"name": "Pizza Margherita", "price": 12.0, "quantity": 2}, ...]
-        """
-        idx = self._product_index()
-        # tokens/candidats à chercher
-        cand = list(idx.keys())
-        found: List[Dict] = []
+        syn = self._synonyms_map()
+        # Synonymes triés par longueur décroissante (pour matcher "pizza margherita" avant "margherita")
+        keys = sorted(syn.keys(), key=len, reverse=True)
 
-        # simple heuristique: on coupe par virgules/et/+
-        parts = []
-        for sep in [",", " et ", " + "]:
-            if sep in msg_norm:
-                msg_norm = msg_norm.replace(sep, "|")
-        parts = [p.strip() for p in msg_norm.split("|") if p.strip()]
+        items: List[Dict] = []
+        for chunk in self._split_phrases(msg_norm):
+            qty = self._qty_in_text(chunk)
+            # enlève la quantité détectée pour mieux matcher le produit
+            chunk_wo_qty = re.sub(r"^\s*\d+\s*(?:x|×)?\s*", "", chunk).strip()
 
-        if not parts:
-            parts = [msg_norm]
+            picked: Product | None = None
+            for k in keys:
+                if k and k in chunk_wo_qty:
+                    picked = syn[k]
+                    break
 
-        for chunk in parts:
-            # quantité
-            qty = 1
-            tokens = chunk.split()
-            if tokens and tokens[0].isdigit():
-                qty = max(1, int(tokens[0]))
-                chunk = " ".join(tokens[1:]).strip()
+            if picked:
+                items.append({
+                    "name": picked.name,
+                    "price": float(picked.price),
+                    "quantity": qty
+                })
 
-            # tente de trouver un produit par plus longue clé
-            best_key = ""
-            for key in cand:
-                if key and key in chunk:
-                    if len(key) > len(best_key):
-                        best_key = key
-            if best_key:
-                p = idx[best_key]
-                found.append({"name": p.name, "price": float(p.price), "quantity": qty})
-
-        return found
+        return items
 
     # ---- main processing
     def process_incoming_message(self, phone: str, message: str) -> str:
         context = self.get_conversation_context(phone)
         intent = self._detect_intent(message)
-
         logging.info(f"[intent={intent}] from={phone} msg={message!r} ctx={context}")
 
         if intent == "greeting":
@@ -368,7 +349,6 @@ class ConversationService:
             context["state"] = "menu_or_order"
 
         elif intent == "menu":
-            # envoi interactif + fallback texte
             products = self._all_available_products()
             products_dict = [{
                 "id": p.id, "name": p.name, "description": p.description, "price": p.price
@@ -386,16 +366,15 @@ class ConversationService:
         elif intent == "order":
             items = self._parse_items(normalize(message))
             if items:
-                # cumule dans le panier
                 context.setdefault("current_order", [])
                 context["current_order"].extend(items)
                 total = sum(i["price"] * i["quantity"] for i in context["current_order"])
-                order_lines = [
+                lines = [
                     f"• {i['quantity']}× {i['name']} — €{i['price'] * i['quantity']:.2f}"
                     for i in context["current_order"]
                 ]
                 response = ("✅ Ajouté à votre commande !\n\n"
-                            "📋 *Récapitulatif*:\n" + "\n".join(order_lines) +
+                            "📋 *Récapitulatif*:\n" + "\n".join(lines) +
                             f"\n\n💰 *Total*: €{total:.2f}\n"
                             "Tapez *confirmer* pour valider, ou continuez à ajouter des articles.")
                 context["state"] = "order_building"
@@ -426,9 +405,6 @@ class ConversationService:
 
     # ---- interactive reply handler
     def process_interactive_reply(self, phone: str, list_reply_id: str, title: str) -> str:
-        """
-        list_reply_id reçu sous la forme 'product_<id>' – on ajoute 1 unité.
-        """
         context = self.get_conversation_context(phone)
         product_id = None
         if list_reply_id.startswith("product_"):
@@ -445,22 +421,20 @@ class ConversationService:
                 context["current_order"].append(item)
 
                 total = sum(i["price"] * i["quantity"] for i in context["current_order"])
-                order_lines = [
+                lines = [
                     f"• {i['quantity']}× {i['name']} — €{i['price'] * i['quantity']:.2f}"
                     for i in context["current_order"]
                 ]
                 response = ("✅ Ajouté au panier depuis le menu.\n\n"
-                            "📋 *Récapitulatif*:\n" + "\n".join(order_lines) +
+                            "📋 *Récapitulatif*:\n" + "\n".join(lines) +
                             f"\n\n💰 *Total*: €{total:.2f}\n"
                             "Tapez *confirmer* pour valider, ou continuez à ajouter des articles.")
                 context["state"] = "order_building"
                 self.update_conversation_context(phone, context)
                 return response
 
-        # fallback si id non reconnu
         return ("Je n'ai pas pu ajouter cet élément. Réessayez depuis le *menu* "
                 "ou envoyez un message du type *1 margherita*.")
-
 
 # -----------------------------------------------------------------------------
 # API
@@ -471,7 +445,6 @@ app = FastAPI(title="WhatsApp AI Agent - Système de Commandes")
 async def root():
     return {"message": "WhatsApp AI Agent actif!", "status": "running"}
 
-
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     verify_token = request.query_params.get("hub.verify_token")
@@ -480,14 +453,8 @@ async def verify_webhook(request: Request):
         return int(challenge)
     raise HTTPException(status_code=403, detail="Token invalide")
 
-
 @app.post("/webhook")
 async def handle_webhook(request: Request, db: Session = Depends(get_db)):
-    """
-    Gère:
-    - messages texte
-    - réponses interactives (list_reply)
-    """
     try:
         body = await request.json()
         logging.info(f"INCOMING: {json.dumps(body)[:1200]}")
@@ -495,18 +462,15 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
         entry = body.get("entry", [])
         if not entry:
             return JSONResponse(content={"status": "ignored"})
-
         changes = entry[0].get("changes", [])
         if not changes:
             return JSONResponse(content={"status": "ignored"})
-
         value = changes[0].get("value", {})
         messages = value.get("messages", [])
         if not messages:
             return JSONResponse(content={"status": "ignored"})
 
         conv = ConversationService(db)
-
         for msg in messages:
             phone_number = msg.get("from")
             msg_type = msg.get("type")
@@ -532,7 +496,6 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
         logging.error(f"Erreur webhook: {e}", exc_info=True)
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
-
 @app.post("/admin/products")
 async def create_product(
     name: str, description: str, price: float, category: str, db: Session = Depends(get_db)
@@ -542,48 +505,6 @@ async def create_product(
     db.commit()
     db.refresh(product)
     return {"message": "Produit créé", "product_id": product.id}
-
-
-@app.get("/admin/orders")
-async def get_orders(db: Session = Depends(get_db)):
-    orders = db.query(Order).all()
-    out = []
-    for o in orders:
-        out.append({
-            "id": o.id,
-            "customer_phone": o.customer.phone_number if o.customer else None,
-            "total": o.total_amount,
-            "status": o.status,
-            "created_at": o.created_at.isoformat(),
-        })
-    return out
-
-
-@app.put("/admin/orders/{order_id}/status")
-async def update_order_status(order_id: int, status: str, db: Session = Depends(get_db)):
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Commande introuvable")
-
-    order.status = status
-    order.updated_at = datetime.utcnow()
-    db.commit()
-
-    whatsapp = WhatsAppService()
-    status_messages = {
-        "confirmed": "✅ Votre commande a été confirmée!",
-        "preparing": "👨‍🍳 Votre commande est en préparation...",
-        "ready": "🎉 Votre commande est prête! Vous pouvez venir la récupérer.",
-        "delivered": "📦 Commande livrée! Merci et à bientôt!",
-        "cancelled": "❌ Votre commande a été annulée. Contactez-nous pour plus d'infos.",
-    }
-    if status in status_messages:
-        # envoyer au client si connu
-        if order.customer:
-            whatsapp.send_message(order.customer.phone_number, f"Commande #{order.id}: {status_messages[status]}")
-
-    return {"message": "Statut mis à jour"}
-
 
 # -----------------------------------------------------------------------------
 # Init + run
@@ -600,7 +521,7 @@ def init_sample_data():
                 Product(name="Pasta Carbonara", description="Pâtes, lardons, crème, parmesan", price=10.0, category="Pasta"),
                 Product(name="Salade César", description="Salade, poulet, parmesan, croûtons", price=8.0, category="Salade"),
                 Product(name="Coca-Cola", description="Boisson gazeuse 33cl", price=3.0, category="Boisson"),
-                Product(name="Eau", description="Eau minérale 50cl", price=2.0, category="Boisson"),
+                Product(name="Eau minérale 50cl", description="Eau minérale 50cl", price=2.0, category="Boisson"),
             ]
             for p in products:
                 db.add(p)
@@ -608,7 +529,6 @@ def init_sample_data():
             logging.info("✅ Données de test initialisées.")
     finally:
         db.close()
-
 
 if __name__ == "__main__":
     init_sample_data()
