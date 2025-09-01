@@ -459,42 +459,67 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
         body = await request.json()
         logging.info(f"INCOMING: {json.dumps(body)[:1200]}")
 
-        entry = body.get("entry", [])
-        if not entry:
-            return JSONResponse(content={"status": "ignored"})
-        changes = entry[0].get("changes", [])
-        if not changes:
-            return JSONResponse(content={"status": "ignored"})
-        value = changes[0].get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return JSONResponse(content={"status": "ignored"})
+        entries = body.get("entry", [])
+        if not entries:
+            return JSONResponse({"status": "ignored"})
 
         conv = ConversationService(db)
-        for msg in messages:
-            phone_number = msg.get("from")
-            msg_type = msg.get("type")
 
-            if msg_type == "text":
-                text = msg.get("text", {}).get("body", "")
-                if text:
-                    reply = conv.process_incoming_message(phone_number, text)
-                    WhatsAppService().send_message(phone_number, reply)
+        processed = False
+        for entry in entries:
+            changes = entry.get("changes", [])
+            for change in changes:
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                statuses = value.get("statuses", [])
 
-            elif msg_type == "interactive":
-                interactive = msg.get("interactive", {})
-                list_reply = interactive.get("list_reply")
-                if list_reply:
-                    lr_id = list_reply.get("id", "")
-                    title = list_reply.get("title", "")
-                    reply = conv.process_interactive_reply(phone_number, lr_id, title)
-                    WhatsAppService().send_message(phone_number, reply)
+                # Statuts (delivered/read/...) -> on log en DEBUG, aucune réponse
+                if statuses and not messages:
+                    logging.debug(f"WA STATUS ONLY: {json.dumps(statuses)[:800]}")
+                    continue
 
-        return JSONResponse(content={"status": "success"})
+                for msg in messages:
+                    from_number = msg.get("from")
+                    mtype = msg.get("type")
+
+                    if mtype == "text":
+                        text = (msg.get("text") or {}).get("body", "")
+                        text = (text or "").strip()
+                        logging.info(f"INCOMING MESSAGE [text] from {from_number}: {text!r}")
+                        if text:
+                            try:
+                                reply = conv.process_incoming_message(from_number, text)
+                            except Exception as e:
+                                logging.exception(f"process_incoming_message error: {e}")
+                                reply = "Oups, petit souci. Réessayez ou tapez *menu*."
+                            WhatsAppService().send_message(from_number, reply)
+                            processed = True
+
+                    elif mtype == "interactive":
+                        interactive = msg.get("interactive", {})
+                        # list reply
+                        if "list_reply" in interactive:
+                            lr = interactive["list_reply"]
+                            lr_id = lr.get("id", "")
+                            title = lr.get("title", "")
+                            logging.info(f"INCOMING MESSAGE [list_reply] {lr_id} / {title}")
+                            reply = conv.process_interactive_reply(from_number, lr_id, title)
+                            WhatsAppService().send_message(from_number, reply)
+                            processed = True
+                        # button reply (au cas où tu ajoutes des boutons)
+                        elif "button_reply" in interactive:
+                            br = interactive["button_reply"]
+                            title = br.get("title", "")
+                            logging.info(f"INCOMING MESSAGE [button_reply] {title}")
+                            reply = conv.process_incoming_message(from_number, title or "menu")
+                            WhatsAppService().send_message(from_number, reply)
+                            processed = True
+
+        return JSONResponse({"status": "success" if processed else "ok-empty"})
 
     except Exception as e:
-        logging.error(f"Erreur webhook: {e}", exc_info=True)
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        logging.exception(f"Erreur webhook: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.post("/admin/products")
 async def create_product(
