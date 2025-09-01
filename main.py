@@ -462,6 +462,14 @@ class ConversationService:
 # -----------------------------------------------------------------------------
 app = FastAPI(title="WhatsApp AI Agent - Système de Commandes")
 
+@app.on_event("startup")
+def _seed_on_startup():
+    try:
+        init_sample_data()   # ne fait rien si les produits existent déjà
+        logging.info("Startup seeding done.")
+    except Exception as e:
+        logging.error(f"Init sample data failed: {e}", exc_info=True)
+
 @app.get("/")
 async def root():
     return {"message": "WhatsApp AI Agent actif!", "status": "running"}
