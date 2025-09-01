@@ -154,8 +154,9 @@ class WhatsAppService:
     def __init__(self):
         self.token = config.WHATSAPP_TOKEN
         self.phone_id = config.WHATSAPP_PHONE_ID
-        self.base_url = f"https://graph.facebook.com/v18.0/{self.phone_id}"
-        
+        # aligne avec tes tests curl
+        self.base_url = f"https://graph.facebook.com/v22.0/{self.phone_id}"
+
     def send_message(self, to: str, message: str) -> bool:
         """Envoie un message texte"""
         url = f"{self.base_url}/messages"
@@ -163,61 +164,24 @@ class WhatsAppService:
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json"
         }
-        
         data = {
             "messaging_product": "whatsapp",
             "to": to,
+            "type": "text",            # <- IMPORTANT
             "text": {"body": message}
         }
-        
         try:
-            response = requests.post(url, json=data, headers=headers)
-            return response.status_code == 200
+            logging.info(f"WA token head: {self.token[:6]}..., phone_id={self.phone_id}")
+            r = requests.post(url, json=data, headers=headers, timeout=15)
+            if r.status_code in (200, 201):
+                logging.info(f"WA send ok: {r.text}")
+                return True
+            logging.error(f"WA send failed {r.status_code}: {r.text}")
+            return False
         except Exception as e:
             logging.error(f"Erreur envoi message: {e}")
             return False
-    
-    def send_interactive_menu(self, to: str, products: List[Dict]) -> bool:
-        """Envoie un menu interactif"""
-        url = f"{self.base_url}/messages"
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json"
-        }
-        
-        sections = [{
-            "title": "Notre Menu",
-            "rows": [
-                {
-                    "id": f"product_{p['id']}",
-                    "title": p['name'],
-                    "description": f"{p['description']} - €{p['price']}"
-                } for p in products[:10]  # Limite WhatsApp
-            ]
-        }]
-        
-        data = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "interactive",
-            "interactive": {
-                "type": "list",
-                "header": {"type": "text", "text": "🍕 Menu Restaurant"},
-                "body": {"text": "Choisissez vos articles:"},
-                "footer": {"text": "Tapez 'commander' pour finaliser"},
-                "action": {
-                    "button": "Voir Menu",
-                    "sections": sections
-                }
-            }
-        }
-        
-        try:
-            response = requests.post(url, json=data, headers=headers)
-            return response.status_code == 200
-        except Exception as e:
-            logging.error(f"Erreur menu interactif: {e}")
-            return False
+
 
 # Service de gestion des commandes
 class OrderService:
