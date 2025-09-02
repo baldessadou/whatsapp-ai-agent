@@ -1,3 +1,4 @@
+# main.py
 # WhatsApp AI Agent – Commandes (R5)
 # FastAPI + SQLAlchemy + WhatsApp Business Cloud API v22
 # - Menu interactif + fallback texte
@@ -5,8 +6,7 @@
 # - Réponse aux list replies
 # - Flux restaurant (confirmation & statuts) + notifications client
 # - Modifications panier (ajouter / supprimer / vider)
-# - FIX: le RESTAURANT_PHONE reçoit une alerte (fallback template si 24h fermée)
-# - FIX: le RESTAURANT_PHONE reçoit une réponse même pour "Hello" (hors commandes admin)
+# - Fallback template pour ouvrir la fenêtre 24h côté restaurant
 
 import os
 import re
@@ -33,7 +33,7 @@ class Config:
     WHATSAPP_PHONE_ID: str = os.getenv("WHATSAPP_PHONE_ID", "your_phone_id")
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "verify_token_123")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./whatsapp_orders.db")
-    # Numéro WhatsApp du restaurant (E.164 SANS '+', ex: 33758262447)
+    # Numéro WhatsApp du restaurant (E.164 sans +, ex: 33758262447)
     RESTAURANT_PHONE: str = os.getenv("RESTAURANT_PHONE", "33758262447")
 
 config = Config()
@@ -101,7 +101,7 @@ def get_db():
         db.close()
 
 # -----------------------------------------------------------------------------
-# Utils
+# Utils / normalisation texte
 # -----------------------------------------------------------------------------
 def normalize(s: str) -> str:
     if not s:
@@ -130,13 +130,13 @@ class WhatsAppService:
             "Content-Type": "application/json",
         }
 
-    def send_text(self, to: str, body: str) -> bool:
+    def send_message(self, to: str, message: str) -> bool:
         url = f"{self.base_url}/messages"
         data = {
             "messaging_product": "whatsapp",
             "to": to,
             "type": "text",
-            "text": {"body": body},
+            "text": {"body": message},
         }
         try:
             r = requests.post(url, json=data, headers=self._headers(), timeout=15)
@@ -147,22 +147,33 @@ class WhatsAppService:
                 logging.error(f"WA text failed {r.status_code}: {r.text}")
             return ok
         except Exception as e:
-            logging.error(f"WA text error: {e}", exc_info=True)
+            logging.error(f"WA text error: {e}")
             return False
 
-    def send_template(self, to: str, name: str, language: str = "en_US", components: Optional[List[Dict]] = None) -> bool:
+    def send_template(self, to: str, name: str, lang: str = "en_US", variables: Optional[List[str]] = None) -> bool:
+        """
+        Envoie un template pour ouvrir la fenêtre 24h si nécessaire.
+        - name: nom du template approuvé (ex: "hello_world")
+        - lang: code langue WA (ex: "en_US", "fr_FR")
+        - variables: liste de textes à injecter dans le body du template
+        """
         url = f"{self.base_url}/messages"
+        components = []
+        if variables:
+            components = [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(v)} for v in variables]
+            }]
         data = {
             "messaging_product": "whatsapp",
             "to": to,
             "type": "template",
             "template": {
                 "name": name,
-                "language": {"code": language},
-            },
+                "language": {"code": lang},
+                "components": components
+            }
         }
-        if components:
-            data["template"]["components"] = components
         try:
             r = requests.post(url, json=data, headers=self._headers(), timeout=15)
             ok = r.status_code in (200, 201)
@@ -172,40 +183,55 @@ class WhatsAppService:
                 logging.error(f"WA template failed {r.status_code}: {r.text}")
             return ok
         except Exception as e:
-            logging.error(f"WA template error: {e}", exc_info=True)
+            logging.error(f"WA template error: {e}")
             return False
 
-    # ---------- Alerte resto avec fallback ----------
-    def notify_restaurant(self, order_id: int, client_phone: str, items: List[Dict]) -> None:
-        total = sum(i["price"] * i["quantity"] for i in items)
-        lines = "\n".join(format_lines(items))
-        admin_msg = (
-            f"🍽️ *Nouvelle commande* #{order_id}\n"
-            f"De: {client_phone}\n\n{lines}\n\n"
-            f"💰 Total: €{total:.2f}\n\n"
-            f"Répondez: *ok {order_id}* / *preparer {order_id}* / "
-            f"*pret {order_id}* / *livre {order_id}* / *annule {order_id}*"
-        )
+    def send_interactive_menu(self, to: str, products: List[Dict]) -> bool:
+        rows = []
+        for p in products[:10]:
+            title = p.get("name", "Article")
+            desc = (p.get("description") or "").strip()
+            price = p.get("price")
+            if price is not None:
+                desc = (desc + (" - " if desc else "")) + f"€{price:.2f}"
+            rows.append({
+                "id": f"product_{p.get('id', title)}",
+                "title": title[:24],
+                "description": desc[:72],
+            })
+        if not rows:
+            return False
 
-        ok = self.send_text(config.RESTAURANT_PHONE, admin_msg)
-        if ok:
-            return
-
-        # Fallback (hors fenêtre 24h ou autre) -> template
-        # Idéalement: crée un template "order_alert" avec des variables.
-        # Pour le test, on utilise hello_world (sans variables).
-        logging.warning("Fallback to template for restaurant alert (24h window or permissions).")
-        self.send_template(
-            config.RESTAURANT_PHONE,
-            name="hello_world",  # remplace par "order_alert" après création/validation Meta
-            language="en_US",
-            # Exemple de components si tu crées "order_alert" avec 3 variables:
-            # components=[{"type":"body","parameters":[
-            #     {"type":"text","text":str(order_id)},
-            #     {"type":"text","text":client_phone},
-            #     {"type":"text","text":f"€{total:.2f}"}
-            # ]}]
-        )
+        url = f"{self.base_url}/messages"
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "header": {"type": "text", "text": "🍕 Notre menu"},
+                "body": {"text": "Répondez par ex. : 2 margherita, 1 coca"},
+                "footer": {"text": "Tapez 'confirmer' pour valider"},
+                "action": {
+                    "button": "Voir menu",
+                    "sections": [{
+                        "title": "Nos produits",
+                        "rows": rows
+                    }]
+                }
+            }
+        }
+        try:
+            r = requests.post(url, json=data, headers=self._headers(), timeout=15)
+            ok = r.status_code in (200, 201)
+            if ok:
+                logging.info(f"WA interactive ok: {r.text}")
+            else:
+                logging.error(f"WA interactive failed {r.status_code}: {r.text}")
+            return ok
+        except Exception as e:
+            logging.error(f"WA interactive error: {e}")
+            return False
 
 # -----------------------------------------------------------------------------
 # Order Service
@@ -244,6 +270,7 @@ class OrderService:
     def set_status(self, order: Order, status: str):
         order.status = status
         order.updated_at = datetime.utcnow()
+        # recalc total (au cas où items modifiés)
         try:
             items = json.loads(order.items or "[]")
             order.total_amount = sum(i["price"] * i["quantity"] for i in items)
@@ -284,7 +311,7 @@ class ConversationService:
             prods = self.db.query(Product).all()
         return prods
 
-    # ---- synonymes
+    # ---- synonymes (mapping texte -> produit)
     def _synonyms_map(self) -> Dict[str, Product]:
         m: Dict[str, Product] = {}
         for p in self._all_available_products():
@@ -365,25 +392,27 @@ class ConversationService:
         context["current_order"].extend(items)
 
     def _remove_items_from_context(self, context: Dict, items: List[Dict]) -> int:
+        """Enlève les items demandés du panier. Retourne nb d'unités retirées."""
         removed = 0
         cart = context.get("current_order", [])
         want: Dict[str, int] = {}
         for it in items:
             want[it["name"]] = want.get(it["name"], 0) + max(1, int(it.get("quantity", 1)))
-        for name, qty_to_remove in want.items():
-            i = 0
-            while i < len(cart) and qty_to_remove > 0:
-                entry = cart[i]
-                if entry["name"].lower() == name.lower():
-                    take = min(entry["quantity"], qty_to_remove)
-                    entry["quantity"] -= take
-                    qty_to_remove -= take
-                    removed += take
-                    if entry["quantity"] <= 0:
-                        cart.pop(i)
-                        continue
-                i += 1
-        context["current_order"] = cart
+
+        i = 0
+        while i < len(cart):
+            entry = cart[i]
+            name = entry["name"]
+            if name in want and want[name] > 0:
+                take = min(entry["quantity"], want[name])
+                entry["quantity"] -= take
+                want[name] -= take
+                removed += take
+                if entry["quantity"] <= 0:
+                    cart.pop(i)
+                    continue
+            i += 1
+        context["current_order"] = [e for e in cart if e["quantity"] > 0]
         return removed
 
     def _cart_response(self, context: Dict, prefix_ok: str, empty_msg: str) -> str:
@@ -412,16 +441,14 @@ class ConversationService:
             products = self._all_available_products()
             products_dict = [{"id": p.id, "name": p.name, "description": p.description, "price": p.price}
                              for p in products]
-            ok = self.whatsapp.send_text(phone, "📋 Menu envoyé ! Vous pouvez aussi me dire directement ce que vous voulez.")
-            if not self._all_available_products() or not ok:
+            ok = self.whatsapp.send_interactive_menu(phone, products_dict)
+            if not ok:
                 lines = ["🍕 *Notre menu*"]
                 for p in products[:10]:
                     lines.append(f"• {p.name} — €{p.price:.2f}")
                 lines.append("\nRépondez par ex. : 2 margherita, 1 coca")
-                self.whatsapp.send_text(phone, "\n".join(lines))
-            else:
-                self.whatsapp.send_interactive_menu(phone, products_dict)
-            response = "📋 Menu envoyé !"
+                self.whatsapp.send_message(phone, "\n".join(lines))
+            response = "📋 Menu envoyé ! Vous pouvez aussi me dire directement ce que vous voulez."
             context["state"] = "menu_shown"
 
         elif intent in ("order", "add"):
@@ -459,9 +486,26 @@ class ConversationService:
             cart = context.get("current_order", [])
             if cart:
                 order = self.order_service.create_order(phone, cart)
-                # Alerte au restaurant (avec fallback template si besoin)
-                self.whatsapp.notify_restaurant(order.id, phone, cart)
-                # Réponse client
+                total = sum(i["price"] * i["quantity"] for i in cart)
+                lines = "\n".join(format_lines(cart))
+                admin_msg = (f"🍽️ *Nouvelle commande* #{order.id}\n"
+                             f"De: {phone}\n\n{lines}\n\n"
+                             f"💰 Total: €{total:.2f}\n\n"
+                             f"Répondez: *ok {order.id}* / *preparer {order.id}* / "
+                             f"*pret {order.id}* / *livre {order.id}* / *annule {order.id}*")
+
+                # Envoi au restaurant + fallback template (fenêtre 24h)
+                sent = self.whatsapp.send_message(config.RESTAURANT_PHONE, admin_msg)
+                if not sent:
+                    # Ouvre la fenêtre 24h avec un template simple puis envoie un court rappel
+                    self.whatsapp.send_template(config.RESTAURANT_PHONE, "hello_world", "en_US")
+                    self.whatsapp.send_message(
+                        config.RESTAURANT_PHONE,
+                        f"Nouvelle commande #{order.id} (total €{total:.2f}). "
+                        f"Commandes: ok/preparer/pret/livre/annule {order.id}"
+                    )
+
+                # Réponse au client
                 response = (f"🎉 Commande #{order.id} envoyée au restaurant.\n"
                             "👨‍🍳 Vous recevrez une notification dès que c'est confirmé.")
                 context["state"] = "order_pending_restaurant"
@@ -512,6 +556,7 @@ def process_admin_command(db: Session, text: str, whatsapp: WhatsAppService) -> 
       - pret 123       -> ready + notif client
       - livre 123      -> delivered + notif client
       - annule 123     -> cancelled + notif client
+    Retourne un accusé au restaurant, ou None si pas de commande reconnue.
     """
     t = normalize(text)
     m = re.search(r"(ok|confirmer|preparer|pret|ready|livre|delivre|annule|cancel)\s*#?\s*(\d+)", t)
@@ -526,9 +571,11 @@ def process_admin_command(db: Session, text: str, whatsapp: WhatsAppService) -> 
     if not order:
         return f"❌ Commande #{oid} introuvable."
 
+    # récup client
     customer = db.query(Customer).filter(Customer.id == order.customer_id).first()
     client_phone = customer.phone_number if customer else None
 
+    # map status
     if cmd in ("ok", "confirmer"):
         new_status = OrderStatus.CONFIRMED
         client_msg = f"✅ Votre commande #{oid} est *confirmée* et passe en préparation."
@@ -548,8 +595,10 @@ def process_admin_command(db: Session, text: str, whatsapp: WhatsAppService) -> 
         return None
 
     svc.set_status(order, new_status)
+
+    # notifie le client si possible
     if client_phone:
-        whatsapp.send_text(client_phone, client_msg)
+        whatsapp.send_message(client_phone, client_msg)
 
     return f"✅ Statut commande #{oid} → {new_status}"
 
@@ -605,28 +654,23 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                     from_number = msg.get("from")
                     mtype = msg.get("type")
 
-                    # --- branche RESTO : si pas commande admin -> répondre quand même
+                    # Si c'est le numéro du restaurant, traiter comme commande admin
                     if from_number == config.RESTAURANT_PHONE and mtype == "text":
                         text = (msg.get("text") or {}).get("body", "") or ""
                         ack = process_admin_command(db, text, wa)
                         if ack:
-                            wa.send_text(config.RESTAURANT_PHONE, ack)
-                            processed = True
-                        else:
-                            conv = ConversationService(db)
-                            reply = conv.process_incoming_message(from_number, text.strip())
-                            wa.send_text(from_number, reply)
+                            wa.send_message(config.RESTAURANT_PHONE, ack)
                             processed = True
                         continue
 
-                    # --- branche CLIENT
+                    # Sinon, flux client normal
                     conv = ConversationService(db)
 
                     if mtype == "text":
                         text = (msg.get("text") or {}).get("body", "") or ""
                         if text.strip():
                             reply = conv.process_incoming_message(from_number, text.strip())
-                            wa.send_text(from_number, reply)
+                            wa.send_message(from_number, reply)
                             processed = True
 
                     elif mtype == "interactive":
@@ -636,7 +680,7 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                             lr_id = lr.get("id", "")
                             title = lr.get("title", "")
                             reply = conv.process_interactive_reply(from_number, lr_id, title)
-                            wa.send_text(from_number, reply)
+                            wa.send_message(from_number, reply)
                             processed = True
 
         return JSONResponse({"status": "success" if processed else "ok-empty"})
