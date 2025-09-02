@@ -1,10 +1,11 @@
 # main.py
-# WhatsApp AI Agent – Commandes (R3)
+# WhatsApp AI Agent – Commandes (R4)
 # FastAPI + SQLAlchemy + WhatsApp Business Cloud API v22
 # - Menu interactif + fallback texte
 # - Parsing robuste ("2 margherita", "2x carbonara", "2 margherita et 1 coca")
 # - Réponse aux list replies
-# - Fallback produits si "available" manquant
+# - Flux restaurant (confirmation & statuts) + notifications client
+# - Modifications panier (ajouter / supprimer / vider)
 
 import os
 import re
@@ -13,8 +14,6 @@ import logging
 import unicodedata
 from datetime import datetime
 from typing import List, Dict, Optional
-from dataclasses import dataclass
-from enum import Enum
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
@@ -28,12 +27,13 @@ import requests
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-@dataclass
 class Config:
     WHATSAPP_TOKEN: str = os.getenv("WHATSAPP_TOKEN", "your_whatsapp_token")
     WHATSAPP_PHONE_ID: str = os.getenv("WHATSAPP_PHONE_ID", "your_phone_id")
     WHATSAPP_VERIFY_TOKEN: str = os.getenv("WHATSAPP_VERIFY_TOKEN", "verify_token_123")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./whatsapp_orders.db")
+    # Numéro WhatsApp du restaurant (E.164 sans +, ex: 33758262447)
+    RESTAURANT_PHONE: str = os.getenv("RESTAURANT_PHONE", "33758262447")
 
 config = Config()
 
@@ -44,7 +44,7 @@ engine = create_engine(config.DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-class OrderStatus(Enum):
+class OrderStatus:
     PENDING = "pending"
     CONFIRMED = "confirmed"
     PREPARING = "preparing"
@@ -68,14 +68,14 @@ class Product(Base):
     description = Column(Text)
     price = Column(Float)
     category = Column(String)
-    # NOTE: string "true"/"false" pour rester compatible avec ta DB existante
+    # string "true"/"false" pour compat avec DB existante
     available = Column(String, default="true")
 
 class Order(Base):
     __tablename__ = "orders"
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
-    status = Column(String, default=OrderStatus.PENDING.value)
+    status = Column(String, default=OrderStatus.PENDING)
     total_amount = Column(Float)
     items = Column(Text)   # JSON
     notes = Column(Text)
@@ -110,6 +110,9 @@ def normalize(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     s = s.replace("-", " ").strip()
     return s
+
+def format_lines(items: List[Dict]) -> List[str]:
+    return [f"• {i['quantity']}× {i['name']} — €{i['price'] * i['quantity']:.2f}" for i in items]
 
 # -----------------------------------------------------------------------------
 # WhatsApp Service (v22)
@@ -147,7 +150,6 @@ class WhatsAppService:
             return False
 
     def send_interactive_menu(self, to: str, products: List[Dict]) -> bool:
-        # Construit les lignes; si pas de produits, on retourne False (fallback)
         rows = []
         for p in products[:10]:
             title = p.get("name", "Article")
@@ -161,7 +163,6 @@ class WhatsAppService:
                 "description": desc[:72],
             })
         if not rows:
-            logging.warning("No products to compose interactive menu; skip WA interactive.")
             return False
 
         url = f"{self.base_url}/messages"
@@ -171,8 +172,8 @@ class WhatsAppService:
             "type": "interactive",
             "interactive": {
                 "type": "list",
-                "header": {"type": "text", "text": "🍕 Menu Restaurant"},
-                "body": {"text": "Choisissez vos articles :"},
+                "header": {"type": "text", "text": "🍕 Notre menu"},
+                "body": {"text": "Répondez par ex. : 2 margherita, 1 coca"},
                 "footer": {"text": "Tapez 'confirmer' pour valider"},
                 "action": {
                     "button": "Voir menu",
@@ -219,11 +220,27 @@ class OrderService:
             total_amount=total,
             items=json.dumps(items),
             notes=notes,
+            status=OrderStatus.PENDING,
         )
         self.db.add(order)
         self.db.commit()
         self.db.refresh(order)
         return order
+
+    def get_order(self, order_id: int) -> Optional[Order]:
+        return self.db.query(Order).filter(Order.id == order_id).first()
+
+    def set_status(self, order: Order, status: str):
+        order.status = status
+        order.updated_at = datetime.utcnow()
+        # recalc total (au cas où items modifiés)
+        try:
+            items = json.loads(order.items or "[]")
+            order.total_amount = sum(i["price"] * i["quantity"] for i in items)
+        except Exception:
+            pass
+        self.db.commit()
+        self.db.refresh(order)
 
 # -----------------------------------------------------------------------------
 # Conversation & Parsing
@@ -252,50 +269,34 @@ class ConversationService:
 
     # ---- produits
     def _all_available_products(self) -> List[Product]:
-        # Essaye d'abord available == "true"
         prods = self.db.query(Product).filter(Product.available == "true").all()
         if not prods:
-            # Fallback : retourne tous les produits (DB ancienne sans "available")
             prods = self.db.query(Product).all()
-        logging.info(f"Loaded products: {len(prods)} (available=='true' fallback if needed)")
         return prods
 
     # ---- synonymes (mapping texte -> produit)
     def _synonyms_map(self) -> Dict[str, Product]:
         m: Dict[str, Product] = {}
         for p in self._all_available_products():
-            full = normalize(p.name)                 # "pizza margherita"
+            full = normalize(p.name)
             words = [w for w in full.split() if w]
             if not words:
                 continue
-            last = words[-1]                         # "margherita"
-
-            # entrées de base
+            last = words[-1]
             m[full] = p
             m[last] = p
-
-            # variantes usuelles / raccourcis
             if "pepperoni" in full:
-                m["pizza pepperoni"] = p
-                m["pepperoni"] = p
+                m["pizza pepperoni"] = p; m["pepperoni"] = p
             if "margherita" in full:
-                m["pizza margherita"] = p
-                m["margherita"] = p
+                m["pizza margherita"] = p; m["margherita"] = p
             if "carbonara" in full:
-                m["carbonara"] = p
-                m["pasta carbonara"] = p
-                m["pates carbonara"] = p
+                m["carbonara"] = p; m["pasta carbonara"] = p; m["pates carbonara"] = p
             if "cesar" in full or "cesar" in last:
-                m["salade cesar"] = p
-                m["cesar"] = p
+                m["salade cesar"] = p; m["cesar"] = p
             if "coca" in full:
-                m["coca"] = p
-                m["coca cola"] = p
+                m["coca"] = p; m["coca cola"] = p
             if "eau" in full:
-                m["eau"] = p
-                m["eau minerale"] = p
-
-        logging.info(f"Synonyms keys: {len(m)}")
+                m["eau"] = p; m["eau minerale"] = p
         return m
 
     # ---- intent
@@ -305,25 +306,28 @@ class ConversationService:
             return "greeting"
         if "menu" in m:
             return "menu"
-        if "confirmer" in m or "valider" in m:
+        if any(w in m for w in ("confirmer", "valider")):
             return "confirm"
+        if any(w in m for w in ("supprimer", "retirer", "enlever", "remove", "delete", "annuler un article")):
+            return "remove"
+        if any(w in m for w in ("ajouter", "ajoute", "add", "plus")):
+            return "add"
+        if "vider" in m or "tout enlever" in m:
+            return "clear"
         if self._parse_items(m):
             return "order"
         return "other"
 
     # ---- parsing
     def _split_phrases(self, m: str) -> List[str]:
-        # Sépare sur virgules, points-virgules, plus, et "et"
         m = re.sub(r"\s*(,|;|\+|\bet\b)\s*", "|", m)
         parts = [p.strip() for p in m.split("|") if p.strip()]
         return parts or [m]
 
     def _qty_in_text(self, s: str) -> int:
-        # attrape "2", "2x", "2 x", "×2", ou "margherita 2"
         m = re.search(r"(\d+)\s*(?:x|×)?", s)
         if m:
             return max(1, int(m.group(1)))
-        # fin de chaîne "margherita 2"
         m = re.search(r"(\d+)\s*$", s)
         return max(1, int(m.group(1))) if m else 1
 
@@ -331,30 +335,60 @@ class ConversationService:
         syn = self._synonyms_map()
         if not syn:
             return []
-
         keys = sorted(syn.keys(), key=len, reverse=True)
         items: List[Dict] = []
-
         for chunk in self._split_phrases(msg_norm):
             qty = self._qty_in_text(chunk)
-            # supprime quantité au début si présente
             chunk_wo_qty = re.sub(r"^\s*\d+\s*(?:x|×)?\s*", "", chunk).strip()
-
             picked: Optional[Product] = None
             for k in keys:
                 if k and k in chunk_wo_qty:
                     picked = syn[k]
                     break
-
             if picked:
-                items.append({
-                    "name": picked.name,
-                    "price": float(picked.price),
-                    "quantity": qty
-                })
-
-        logging.info(f"Parsed items from '{msg_norm}': {items}")
+                items.append({"name": picked.name, "price": float(picked.price), "quantity": qty})
         return items
+
+    # ---- helpers panier
+    def _add_items_to_context(self, context: Dict, items: List[Dict]) -> None:
+        context.setdefault("current_order", [])
+        context["current_order"].extend(items)
+
+    def _remove_items_from_context(self, context: Dict, items: List[Dict]) -> int:
+        """Enlève les items demandés du panier. Retourne nb d'unités retirées."""
+        removed = 0
+        cart = context.get("current_order", [])
+        # Map rapide nom -> total qty
+        want: Dict[str, int] = {}
+        for it in items:
+            want[it["name"]] = want.get(it["name"], 0) + max(1, int(it.get("quantity", 1)))
+
+        # Parcours et décrémente
+        for name, qty_to_remove in want.items():
+            i = 0
+            while i < len(cart) and qty_to_remove > 0:
+                entry = cart[i]
+                if entry["name"].lower() == name.lower():
+                    take = min(entry["quantity"], qty_to_remove)
+                    entry["quantity"] -= take
+                    qty_to_remove -= take
+                    removed += take
+                    if entry["quantity"] <= 0:
+                        cart.pop(i)
+                        continue
+                i += 1
+        context["current_order"] = cart
+        return removed
+
+    def _cart_response(self, context: Dict, prefix_ok: str, empty_msg: str) -> str:
+        cart = context.get("current_order", [])
+        if not cart:
+            return empty_msg
+        total = sum(i["price"] * i["quantity"] for i in cart)
+        return (f"{prefix_ok}\n\n📋 *Récapitulatif*:\n" +
+                "\n".join(format_lines(cart)) +
+                f"\n\n💰 *Total*: €{total:.2f}\n"
+                "Tapez *confirmer* pour valider, ou continuez à ajouter/supprimer des articles.")
 
     # ---- main dialogue
     def process_incoming_message(self, phone: str, message: str) -> str:
@@ -370,10 +404,8 @@ class ConversationService:
 
         elif intent == "menu":
             products = self._all_available_products()
-            products_dict = [
-                {"id": p.id, "name": p.name, "description": p.description, "price": p.price}
-                for p in products
-            ]
+            products_dict = [{"id": p.id, "name": p.name, "description": p.description, "price": p.price}
+                             for p in products]
             ok = self.whatsapp.send_interactive_menu(phone, products_dict)
             if not ok:
                 lines = ["🍕 *Notre menu*"]
@@ -384,34 +416,56 @@ class ConversationService:
             response = "📋 Menu envoyé ! Vous pouvez aussi me dire directement ce que vous voulez."
             context["state"] = "menu_shown"
 
-        elif intent == "order":
+        elif intent in ("order", "add"):
             items = self._parse_items(normalize(message))
             if items:
-                context.setdefault("current_order", [])
-                context["current_order"].extend(items)
-                total = sum(i["price"] * i["quantity"] for i in context["current_order"])
-                lines = [
-                    f"• {i['quantity']}× {i['name']} — €{i['price'] * i['quantity']:.2f}"
-                    for i in context["current_order"]
-                ]
-                response = ("✅ Ajouté à votre commande !\n\n"
-                            "📋 *Récapitulatif*:\n" + "\n".join(lines) +
-                            f"\n\n💰 *Total*: €{total:.2f}\n"
-                            "Tapez *confirmer* pour valider, ou continuez à ajouter des articles.")
+                self._add_items_to_context(context, items)
+                response = self._cart_response(context, "✅ Ajouté à votre commande !",
+                                               "Votre panier est vide.")
                 context["state"] = "order_building"
             else:
                 response = ("Je n'ai pas bien compris les articles. Donnez un format comme : "
                             "*2 margherita et 1 coca*.")
 
+        elif intent == "remove":
+            items = self._parse_items(normalize(message))
+            if "vider" in normalize(message) or not items:
+                # si pas d'item explicite mais commande remove => tenter vider
+                if context.get("current_order"):
+                    context["current_order"] = []
+                    response = "🧺 Panier vidé."
+                else:
+                    response = "Votre panier est déjà vide."
+            else:
+                removed = self._remove_items_from_context(context, items)
+                if removed > 0:
+                    response = self._cart_response(context, "🗑️ Article(s) retiré(s).",
+                                                   "Votre panier est vide après suppression.")
+                else:
+                    response = "Je n'ai pas trouvé ces articles dans votre panier."
+
+        elif intent == "clear":
+            context["current_order"] = []
+            response = "🧺 Panier vidé."
+
         elif intent == "confirm":
             cart = context.get("current_order", [])
             if cart:
                 order = self.order_service.create_order(phone, cart)
-                response = (f"🎉 Commande confirmée ! Numéro: #{order.id}\n"
-                            "⏰ Temps de préparation: 25–30 minutes\n"
-                            f"💰 Total: €{order.total_amount:.2f}\n"
-                            "Vous recevrez une notification quand c'est prêt !")
-                context["state"] = "order_confirmed"
+                # Envoi au restaurant
+                total = sum(i["price"] * i["quantity"] for i in cart)
+                lines = "\n".join(format_lines(cart))
+                admin_msg = (f"🍽️ *Nouvelle commande* #{order.id}\n"
+                             f"De: {phone}\n\n{lines}\n\n"
+                             f"💰 Total: €{total:.2f}\n\n"
+                             f"Répondez: *ok {order.id}* / *preparer {order.id}* / "
+                             f"*pret {order.id}* / *livre {order.id}* / *annule {order.id}*")
+                self.whatsapp.send_message(config.RESTAURANT_PHONE, admin_msg)
+
+                # Réponse au client (attente confirmation resto)
+                response = (f"🎉 Commande #{order.id} envoyée au restaurant.\n"
+                            "👨‍🍳 Vous recevrez une notification dès que c'est confirmé.")
+                context["state"] = "order_pending_restaurant"
                 context["current_order"] = []
                 context["last_order_id"] = order.id
             else:
@@ -438,24 +492,72 @@ class ConversationService:
             p = self.db.query(Product).filter(Product.id == product_id).first()
             if p:
                 item = {"name": p.name, "price": float(p.price), "quantity": 1}
-                context.setdefault("current_order", [])
-                context["current_order"].append(item)
-
-                total = sum(i["price"] * i["quantity"] for i in context["current_order"])
-                lines = [
-                    f"• {i['quantity']}× {i['name']} — €{i['price'] * i['quantity']:.2f}"
-                    for i in context["current_order"]
-                ]
-                response = ("✅ Ajouté au panier depuis le menu.\n\n"
-                            "📋 *Récapitulatif*:\n" + "\n".join(lines) +
-                            f"\n\n💰 *Total*: €{total:.2f}\n"
-                            "Tapez *confirmer* pour valider, ou continuez à ajouter des articles.")
+                self._add_items_to_context(context, [item])
+                response = self._cart_response(context, "✅ Ajouté au panier depuis le menu.",
+                                               "Votre panier est vide.")
                 context["state"] = "order_building"
                 self.update_conversation_context(phone, context)
                 return response
 
         return ("Je n'ai pas pu ajouter cet élément. Réessayez depuis le *menu* "
                 "ou envoyez un message du type *1 margherita*.")
+
+# -----------------------------------------------------------------------------
+# Admin / Restaurant commands
+# -----------------------------------------------------------------------------
+def process_admin_command(db: Session, text: str, whatsapp: WhatsAppService) -> Optional[str]:
+    """
+    Commandes admin (restaurant) par WhatsApp :
+      - ok 123         -> confirmed + notif client
+      - preparer 123   -> preparing + notif client
+      - pret 123       -> ready + notif client
+      - livre 123      -> delivered + notif client
+      - annule 123     -> cancelled + notif client
+    Retourne un accusé au restaurant, ou None si pas de commande reconnue.
+    """
+    t = normalize(text)
+    m = re.search(r"(ok|confirmer|preparer|pret|ready|livre|delivre|annule|cancel)\s*#?\s*(\d+)", t)
+    if not m:
+        return None
+
+    cmd = m.group(1)
+    oid = int(m.group(2))
+
+    svc = OrderService(db)
+    order = svc.get_order(oid)
+    if not order:
+        return f"❌ Commande #{oid} introuvable."
+
+    # récup client
+    customer = db.query(Customer).filter(Customer.id == order.customer_id).first()
+    client_phone = customer.phone_number if customer else None
+
+    # map status
+    if cmd in ("ok", "confirmer"):
+        new_status = OrderStatus.CONFIRMED
+        client_msg = f"✅ Votre commande #{oid} est *confirmée* et passe en préparation."
+    elif cmd in ("preparer",):
+        new_status = OrderStatus.PREPARING
+        client_msg = f"👨‍🍳 Votre commande #{oid} est *en préparation*."
+    elif cmd in ("pret", "ready"):
+        new_status = OrderStatus.READY
+        client_msg = f"🎉 Votre commande #{oid} est *prête*. Vous pouvez venir la récupérer."
+    elif cmd in ("livre", "delivre"):
+        new_status = OrderStatus.DELIVERED
+        client_msg = f"📦 Votre commande #{oid} a été *livrée*. Merci !"
+    elif cmd in ("annule", "cancel"):
+        new_status = OrderStatus.CANCELLED
+        client_msg = f"❌ Votre commande #{oid} a été *annulée*. Contactez-nous pour plus d'infos."
+    else:
+        return None
+
+    svc.set_status(order, new_status)
+
+    # notifie le client si possible
+    if client_phone:
+        whatsapp.send_message(client_phone, client_msg)
+
+    return f"✅ Statut commande #{oid} → {new_status}"
 
 # -----------------------------------------------------------------------------
 # API
@@ -465,7 +567,7 @@ app = FastAPI(title="WhatsApp AI Agent - Système de Commandes")
 @app.on_event("startup")
 def _seed_on_startup():
     try:
-        init_sample_data()   # ne fait rien si les produits existent déjà
+        init_sample_data()
         logging.info("Startup seeding done.")
     except Exception as e:
         logging.error(f"Init sample data failed: {e}", exc_info=True)
@@ -492,7 +594,7 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
         if not entries:
             return JSONResponse({"status": "ignored"})
 
-        conv = ConversationService(db)
+        wa = WhatsAppService()
         processed = False
 
         for entry in entries:
@@ -509,13 +611,23 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                     from_number = msg.get("from")
                     mtype = msg.get("type")
 
+                    # Si c'est le numéro du restaurant, traiter comme commande admin
+                    if from_number == config.RESTAURANT_PHONE and mtype == "text":
+                        text = (msg.get("text") or {}).get("body", "") or ""
+                        ack = process_admin_command(db, text, wa)
+                        if ack:
+                            wa.send_message(config.RESTAURANT_PHONE, ack)
+                            processed = True
+                        continue
+
+                    # Sinon, flux client normal
+                    conv = ConversationService(db)
+
                     if mtype == "text":
-                        text = (msg.get("text") or {}).get("body", "")
-                        text = (text or "").strip()
-                        logging.info(f"INCOMING MESSAGE [text] from {from_number}: {text!r}")
-                        if text:
-                            reply = conv.process_incoming_message(from_number, text)
-                            WhatsAppService().send_message(from_number, reply)
+                        text = (msg.get("text") or {}).get("body", "") or ""
+                        if text.strip():
+                            reply = conv.process_incoming_message(from_number, text.strip())
+                            wa.send_message(from_number, reply)
                             processed = True
 
                     elif mtype == "interactive":
@@ -524,9 +636,8 @@ async def handle_webhook(request: Request, db: Session = Depends(get_db)):
                             lr = interactive["list_reply"]
                             lr_id = lr.get("id", "")
                             title = lr.get("title", "")
-                            logging.info(f"INCOMING MESSAGE [list_reply] {lr_id} / {title}")
                             reply = conv.process_interactive_reply(from_number, lr_id, title)
-                            WhatsAppService().send_message(from_number, reply)
+                            wa.send_message(from_number, reply)
                             processed = True
 
         return JSONResponse({"status": "success" if processed else "ok-empty"})
@@ -556,12 +667,7 @@ def init_sample_data():
                 db.add(p)
             db.commit()
             logging.info("✅ Données de test initialisées.")
-        else:
-            # Optionnel : log si les produits existants n'ont pas 'available' test 
-            missing = db.query(Product).filter((Product.available.is_(None)) | (Product.available == "")).count()
-            if missing:
-                logging.warning(f"{missing} produits sans 'available' défini (fallback all-products activé).")
-    finally: 
+    finally:
         db.close()
 
 if __name__ == "__main__":
