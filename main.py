@@ -1,11 +1,12 @@
 # main.py
-# WhatsApp AI Agent – Commandes (R4)
+# WhatsApp AI Agent – Commandes (R5)
 # FastAPI + SQLAlchemy + WhatsApp Business Cloud API v22
 # - Menu interactif + fallback texte
 # - Parsing robuste ("2 margherita", "2x carbonara", "2 margherita et 1 coca")
 # - Réponse aux list replies
 # - Flux restaurant (confirmation & statuts) + notifications client
 # - Modifications panier (ajouter / supprimer / vider)
+# - Fallback template pour ouvrir la fenêtre 24h côté restaurant
 
 import os
 import re
@@ -147,6 +148,42 @@ class WhatsAppService:
             return ok
         except Exception as e:
             logging.error(f"WA text error: {e}")
+            return False
+
+    def send_template(self, to: str, name: str, lang: str = "en_US", variables: Optional[List[str]] = None) -> bool:
+        """
+        Envoie un template pour ouvrir la fenêtre 24h si nécessaire.
+        - name: nom du template approuvé (ex: "hello_world")
+        - lang: code langue WA (ex: "en_US", "fr_FR")
+        - variables: liste de textes à injecter dans le body du template
+        """
+        url = f"{self.base_url}/messages"
+        components = []
+        if variables:
+            components = [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(v)} for v in variables]
+            }]
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": name,
+                "language": {"code": lang},
+                "components": components
+            }
+        }
+        try:
+            r = requests.post(url, json=data, headers=self._headers(), timeout=15)
+            ok = r.status_code in (200, 201)
+            if ok:
+                logging.info(f"WA template ok: {r.text}")
+            else:
+                logging.error(f"WA template failed {r.status_code}: {r.text}")
+            return ok
+        except Exception as e:
+            logging.error(f"WA template error: {e}")
             return False
 
     def send_interactive_menu(self, to: str, products: List[Dict]) -> bool:
@@ -358,26 +395,24 @@ class ConversationService:
         """Enlève les items demandés du panier. Retourne nb d'unités retirées."""
         removed = 0
         cart = context.get("current_order", [])
-        # Map rapide nom -> total qty
         want: Dict[str, int] = {}
         for it in items:
             want[it["name"]] = want.get(it["name"], 0) + max(1, int(it.get("quantity", 1)))
 
-        # Parcours et décrémente
-        for name, qty_to_remove in want.items():
-            i = 0
-            while i < len(cart) and qty_to_remove > 0:
-                entry = cart[i]
-                if entry["name"].lower() == name.lower():
-                    take = min(entry["quantity"], qty_to_remove)
-                    entry["quantity"] -= take
-                    qty_to_remove -= take
-                    removed += take
-                    if entry["quantity"] <= 0:
-                        cart.pop(i)
-                        continue
-                i += 1
-        context["current_order"] = cart
+        i = 0
+        while i < len(cart):
+            entry = cart[i]
+            name = entry["name"]
+            if name in want and want[name] > 0:
+                take = min(entry["quantity"], want[name])
+                entry["quantity"] -= take
+                want[name] -= take
+                removed += take
+                if entry["quantity"] <= 0:
+                    cart.pop(i)
+                    continue
+            i += 1
+        context["current_order"] = [e for e in cart if e["quantity"] > 0]
         return removed
 
     def _cart_response(self, context: Dict, prefix_ok: str, empty_msg: str) -> str:
@@ -430,7 +465,6 @@ class ConversationService:
         elif intent == "remove":
             items = self._parse_items(normalize(message))
             if "vider" in normalize(message) or not items:
-                # si pas d'item explicite mais commande remove => tenter vider
                 if context.get("current_order"):
                     context["current_order"] = []
                     response = "🧺 Panier vidé."
@@ -452,7 +486,6 @@ class ConversationService:
             cart = context.get("current_order", [])
             if cart:
                 order = self.order_service.create_order(phone, cart)
-                # Envoi au restaurant
                 total = sum(i["price"] * i["quantity"] for i in cart)
                 lines = "\n".join(format_lines(cart))
                 admin_msg = (f"🍽️ *Nouvelle commande* #{order.id}\n"
@@ -460,9 +493,19 @@ class ConversationService:
                              f"💰 Total: €{total:.2f}\n\n"
                              f"Répondez: *ok {order.id}* / *preparer {order.id}* / "
                              f"*pret {order.id}* / *livre {order.id}* / *annule {order.id}*")
-                self.whatsapp.send_message(config.RESTAURANT_PHONE, admin_msg)
 
-                # Réponse au client (attente confirmation resto)
+                # Envoi au restaurant + fallback template (fenêtre 24h)
+                sent = self.whatsapp.send_message(config.RESTAURANT_PHONE, admin_msg)
+                if not sent:
+                    # Ouvre la fenêtre 24h avec un template simple puis envoie un court rappel
+                    self.whatsapp.send_template(config.RESTAURANT_PHONE, "hello_world", "en_US")
+                    self.whatsapp.send_message(
+                        config.RESTAURANT_PHONE,
+                        f"Nouvelle commande #{order.id} (total €{total:.2f}). "
+                        f"Commandes: ok/preparer/pret/livre/annule {order.id}"
+                    )
+
+                # Réponse au client
                 response = (f"🎉 Commande #{order.id} envoyée au restaurant.\n"
                             "👨‍🍳 Vous recevrez une notification dès que c'est confirmé.")
                 context["state"] = "order_pending_restaurant"
@@ -675,4 +718,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
- 
